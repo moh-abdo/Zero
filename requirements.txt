@@ -1,9 +1,4 @@
-python-telegram-bot==20.5
-psycopg2-binary==2.9.10
-python-dotenv==1.0.0
-fpdf2==2.5.5
-qrcode==7.4
-Pillow==9.5.0
-arabic-reshaper==0.3.1
-python-bidi==0.4.2
-supabase==1.0.0
+Flask>=2.0
+python-dotenv>=1.0
+# Optional: if you switch to PostgreSQL change db_service to use psycopg2-binary
+# psycopg2-binary>=2.9

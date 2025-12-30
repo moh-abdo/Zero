@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+  <div class="row">
+    <div class="col-md-6">
+      <div class="card mb-3">
+        <div class="card-body">
+          <h5 class="card-title">Users</h5>
+          <p class="card-text">Total users: <strong>{{ users_count }}</strong></p>
+          <a href="{{ url_for('admin_users') }}" class="btn btn-sm btn-primary">View users</a>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="card mb-3">
+        <div class="card-body">
+          <h5 class="card-title">Receipts</h5>
+          <p class="card-text">Total receipts: <strong>{{ receipts_count }}</strong></p>
+          <a href="{{ url_for('admin_receipts') }}" class="btn btn-sm btn-primary">View receipts</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h4>Recent Users</h4>
+  <div class="table-responsive mb-4">
+    <table class="table table-striped">
+      <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Created</th></tr></thead>
+      <tbody>
+        {% for u in recent_users %}
+          <tr>
+            <td>{{ u.id }}</td>
+            <td>{{ u.name }}</td>
+            <td>{{ u.email }}</td>
+            <td>{{ u.created_at }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Recent Receipts</h4>
+  <div class="table-responsive">
+    <table class="table table-striped">
+      <thead><tr><th>ID</th><th>User ID</th><th>Amount</th><th>Status</th><th>Created</th></tr></thead>
+      <tbody>
+        {% for r in recent_receipts %}
+          <tr>
+            <td>{{ r.id }}</td>
+            <td>{{ r.user_id }}</td>
+            <td>{{ r.amount }}</td>
+            <td>{{ r.status }}</td>
+            <td>{{ r.created_at }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

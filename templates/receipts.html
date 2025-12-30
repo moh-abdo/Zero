@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Receipts{% endblock %}
+{% block content %}
+  <h2>Receipts</h2>
+  <div class="table-responsive">
+    <table class="table table-hover">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>User ID</th>
+          <th>Amount</th>
+          <th>Status</th>
+          <th>Description</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in receipts %}
+        <tr>
+          <td>{{ r.id }}</td>
+          <td>{{ r.user_id }}</td>
+          <td>{{ r.amount }}</td>
+          <td>{{ r.status }}</td>
+          <td>{{ r.description }}</td>
+          <td>{{ r.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6">No receipts found.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

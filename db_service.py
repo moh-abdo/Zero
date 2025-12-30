@@ -1,143 +1,175 @@
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
 from datetime import datetime
-from decimal import Decimal
-import logging
+from werkzeug.security import generate_password_hash, check_password_hash
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DATABASE_PATH", "./data.db")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set in environment")
-    return psycopg2.connect(DATABASE_URL)
+def row_to_dict(row):
+    if row is None:
+        return None
+    return {k: row[k] for k in row.keys()}
 
 def init_db():
-    conn = get_conn()
+    conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE NOT NULL,
-        username TEXT,
-        balance NUMERIC DEFAULT 0,
-        created_at TIMESTAMP DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS receipts (
-        id SERIAL PRIMARY KEY,
-        user_telegram_id BIGINT NOT NULL,
-        file_path TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT NOW()
-    );
-    """)
+    # admins table
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    # users table (example)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    ''')
+    # receipts table (example)
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            status TEXT NOT NULL,
+            description TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
     conn.commit()
-    cur.close()
     conn.close()
-    logger.info("Database initialized")
 
-# User management
-def create_user_if_not_exists(telegram_id: int, username: str = None):
-    conn = get_conn()
+# Admin functions
+def create_admin(username, password):
+    if not username or not password:
+        raise ValueError("username and password are required")
+    conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute(
-            "INSERT INTO users (telegram_id, username) VALUES (%s, %s)",
-            (telegram_id, username),
-        )
+    password_hash = generate_password_hash(password)
+    created_at = datetime.utcnow().isoformat()
+    try:
+        cur.execute("INSERT INTO admins (username, password_hash, created_at) VALUES (?, ?, ?)",
+                    (username, password_hash, created_at))
         conn.commit()
-    else:
-        # optionally update username
-        if username:
-            cur.execute(
-                "UPDATE users SET username = %s WHERE telegram_id = %s",
-                (username, telegram_id),
-            )
-            conn.commit()
-    cur.close()
-    conn.close()
-
-def get_user_by_username(username: str):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    # strip leading @ if provided
-    if username.startswith("@"):
-        username = username[1:]
-    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user
-
-def get_user_by_telegram_id(telegram_id: int):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user
-
-def get_balance(telegram_id: int) -> Decimal:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM users WHERE telegram_id = %s", (telegram_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    if not row:
-        return Decimal(0)
-    return Decimal(row[0])
-
-def update_balance(telegram_id: int, amount: float) -> Decimal:
-    conn = get_conn()
-    cur = conn.cursor()
-    # Ensure user exists
-    cur.execute("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
-    if not cur.fetchone():
-        cur.execute(
-            "INSERT INTO users (telegram_id, balance) VALUES (%s, %s)",
-            (telegram_id, amount),
-        )
-        conn.commit()
-        cur.close()
+    except sqlite3.IntegrityError:
+        # user already exists: ignore
+        pass
+    finally:
         conn.close()
-        return Decimal(amount)
 
-    cur.execute(
-        "UPDATE users SET balance = balance + %s WHERE telegram_id = %s RETURNING balance",
-        (Decimal(str(amount)), telegram_id),
-    )
-    new_balance = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
-    conn.close()
-    return Decimal(new_balance)
-
-# Receipts
-def create_receipt(telegram_id: int, file_path: str, status: str = 'pending') -> int:
-    conn = get_conn()
+def get_admin_by_username(username):
+    conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO receipts (user_telegram_id, file_path, status, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
-        (telegram_id, file_path, status, datetime.utcnow()),
-    )
-    receipt_id = cur.fetchone()[0]
-    conn.commit()
-    cur.close()
+    cur.execute("SELECT * FROM admins WHERE username = ?", (username,))
+    row = cur.fetchone()
     conn.close()
-    return receipt_id
+    return row_to_dict(row)
 
-def set_receipt_status(receipt_id: int, status: str):
-    conn = get_conn()
+def check_admin_credentials(username, password):
+    admin = get_admin_by_username(username)
+    if not admin:
+        return False
+    return check_password_hash(admin["password_hash"], password)
+
+# Users functions
+def create_user(name, email):
+    conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE receipts SET status = %s WHERE id = %s", (status, receipt_id))
-    conn.commit()
-    cur.close()
+    created_at = datetime.utcnow().isoformat()
+    try:
+        cur.execute("INSERT INTO users (name, email, created_at) VALUES (?, ?, ?)",
+                    (name, email, created_at))
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError:
+        return None
+    finally:
+        conn.close()
+
+def get_user_by_id(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
     conn.close()
+    return row_to_dict(row)
+
+def get_users(limit=None, offset=0):
+    conn = get_connection()
+    cur = conn.cursor()
+    if limit:
+        cur.execute("SELECT * FROM users ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+    else:
+        cur.execute("SELECT * FROM users ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return [row_to_dict(r) for r in rows]
+
+def count_users():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as cnt FROM users")
+    row = cur.fetchone()
+    conn.close()
+    return row["cnt"] if row else 0
+
+# Receipts functions
+def create_receipt(user_id, amount, status="pending", description=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    created_at = datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO receipts (user_id, amount, status, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, amount, status, description, created_at)
+    )
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
+
+def get_receipt_by_id(receipt_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM receipts WHERE id = ?", (receipt_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_dict(row)
+
+def get_receipts(limit=None, offset=0):
+    conn = get_connection()
+    cur = conn.cursor()
+    if limit:
+        cur.execute("SELECT * FROM receipts ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+    else:
+        cur.execute("SELECT * FROM receipts ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return [row_to_dict(r) for r in rows]
+
+def get_receipts_by_user(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM receipts WHERE user_id = ? ORDER BY id DESC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [row_to_dict(r) for r in rows]
+
+def count_receipts():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as cnt FROM receipts")
+    row = cur.fetchone()
+    conn.close()
+    return row["cnt"] if row else 0
