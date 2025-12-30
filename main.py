@@ -1,179 +1,178 @@
 import logging
-import uuid
 import os
-import tempfile
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import time
+import asyncio
+from decimal import Decimal
+
+from telegram import Update, InputFile
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes,
-    ConversationHandler, MessageHandler, filters, CallbackQueryHandler
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
-from config import BOT_TOKEN, SAR_TO_YER_RATE, REQUIRED_YER_AMOUNT, TEMP_PDF_DIR
-from db_service import DBService
-from payment_service import verify_kuraimi_payment
-from pdf_generator import generate_sick_leave_pdf
-from storage_service import upload_receipt
+
+import config
+import db_service
+import storage_service
 
 logging.basicConfig(level=logging.INFO)
-
-# States
-NAME, DURATION, AWAIT_RECEIPT = range(3)
+logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton('طلب إجازة مرضية', callback_data='request')]]
-    # If update is a callback query, reply accordingly
-    if update.message:
-        await update.message.reply_text('مرحبًا! اختر ما تود فعله:', reply_markup=InlineKeyboardMarkup(keyboard))
-    elif update.callback_query:
-        await update.callback_query.message.reply_text('مرحبًا! اختر ما تود فعله:', reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == 'request':
-        await query.message.reply_text('الرجاء إرسال اسم المريض بالكامل:')
-        return NAME
-    return ConversationHandler.END
-
-async def name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['patient_name'] = update.message.text.strip()
-    await update.message.reply_text('كم مدة الإجازة؟ (مثال: يوم، يومين)')
-    return DURATION
-
-async def duration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['duration'] = update.message.text.strip()
-
-    # show summary and payment instructions
-    amount = REQUIRED_YER_AMOUNT
-    summary = (
-        f"ملخص الطلب:\n"
-        f"الاسم: {context.user_data['patient_name']}\n"
-        f"مدة الإجازة: {context.user_data['duration']}\n"
-        f"المبلغ المطلوب: {amount} ر.ي\n\n"
-        f"الرجاء تحويل المبلغ إلى حساب التاجر في الكريمي وإرسال صورة الإيصال هنا."
+    user = update.effective_user
+    if not user:
+        return
+    # Ensure user exists in DB
+    await asyncio.to_thread(db_service.create_user_if_not_exists, user.id, user.username)
+    await update.message.reply_text(
+        "Welcome! Use /balance to check your balance. Send a photo or document to upload a receipt."
     )
-    await update.message.reply_text(summary)
-    return AWAIT_RECEIPT
 
-async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Ensure a photo was sent
-    if not update.message.photo:
-        await update.message.reply_text('الرجاء إرسال صورة الإيصال كملف صورة.')
-        return AWAIT_RECEIPT
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    bal = await asyncio.to_thread(db_service.get_balance, user.id)
+    await update.message.reply_text(f"Your balance: {bal}")
 
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return
 
-    # prepare temp paths
-    os.makedirs(TEMP_PDF_DIR, exist_ok=True)
-    tmp_receipt_path = os.path.join(TEMP_PDF_DIR, f"receipt_{uuid.uuid4().hex}.jpg")
+    file = None
+    filename = None
+    # photo
+    if message.photo:
+        tg_file = await message.photo[-1].get_file()
+        filename = f"{user.id}_{int(time.time())}_{tg_file.file_unique_id}.jpg"
+        download_path = os.path.join("/tmp", filename)
+        await tg_file.download_to_drive(download_path)
+        saved_path = await asyncio.to_thread(storage_service.save_local, download_path, filename)
+    elif message.document:
+        tg_file = await message.document.get_file()
+        # preserve ext if possible
+        ext = os.path.splitext(message.document.file_name or "")[1] or ""
+        filename = f"{user.id}_{int(time.time())}_{tg_file.file_unique_id}{ext}"
+        download_path = os.path.join("/tmp", filename)
+        await tg_file.download_to_drive(download_path)
+        saved_path = await asyncio.to_thread(storage_service.save_local, download_path, filename)
+    else:
+        await message.reply_text("Please send a photo or document as a receipt.")
+        return
 
-    await file.download_to_drive(tmp_receipt_path)
+    # Create pending receipt in DB
+    receipt_id = await asyncio.to_thread(db_service.create_receipt, user.id, saved_path, 'pending')
 
-    # verify payment (simulate)
-    amount = REQUIRED_YER_AMOUNT
-    verified = await verify_kuraimi_payment(amount=amount, receipt_file_path=tmp_receipt_path)
+    await message.reply_text("Receipt uploaded and is pending approval. Thank you!")
 
-    if not verified:
-        await update.message.reply_text('لم نتمكن من التحقق من الدفع. الرجاء المحاولة أو الاتصال بالدعم.')
+    # Notify admins with link to whatsapp contact and the uploaded file
+    caption = f"New receipt uploaded by @{user.username or user.first_name} (id: {user.id})\nReceipt ID: {receipt_id}\nStatus: pending"
+    wa_num = config.ADMIN_WHATSAPP_NUMBER
+    wa_link = f"https://wa.me/{wa_num}" if wa_num else ""
+    if wa_link:
+        caption += f"\nContact via WhatsApp: {wa_link}"
+
+    for admin_id in config.ADMINS:
         try:
-            os.remove(tmp_receipt_path)
-        except Exception:
-            pass
-        return ConversationHandler.END
+            # send file as document to ensure it can be viewed
+            await context.bot.send_document(chat_id=admin_id, document=InputFile(saved_path), caption=caption)
+        except Exception as e:
+            logger.exception(f"Failed to notify admin {admin_id}: {e}")
 
-    # Upload receipt to Supabase Storage
+async def credit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if user.id not in config.ADMINS:
+        await update.message.reply_text("You are not authorized to use this command.")
+        return
+
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Usage: /credit <telegram_id|@username> <amount>")
+        return
+
+    target = args[0]
+    amount_raw = args[1]
     try:
-        user_id = update.message.from_user.id
-        filename = os.path.basename(tmp_receipt_path)
-        object_name = f"{user_id}/{filename}"
-        receipt_url = upload_receipt(tmp_receipt_path, object_name)
+        amount = float(amount_raw)
+    except ValueError:
+        await update.message.reply_text("Invalid amount. Use a number.")
+        return
+
+    # Resolve user id
+    target_user = None
+    target_id = None
+    if target.startswith("@"):
+        target_user = await asyncio.to_thread(db_service.get_user_by_username, target)
+        if not target_user:
+            await update.message.reply_text("User not found in DB by that username.")
+            return
+        target_id = int(target_user['telegram_id'])
+    else:
+        try:
+            target_id = int(target)
+        except ValueError:
+            await update.message.reply_text("Invalid telegram id or username.")
+            return
+
+    # Ensure user exists
+    await asyncio.to_thread(db_service.create_user_if_not_exists, target_id, None)
+    new_balance = await asyncio.to_thread(db_service.update_balance, target_id, amount)
+
+    # Notify target user
+    try:
+        await context.bot.send_message(chat_id=target_id, text=f"Your account has been credited with {amount}. New balance: {new_balance}")
     except Exception as e:
-        logging.exception('Failed to upload receipt to storage')
-        await update.message.reply_text('حدث خطأ أثناء رفع الإيصال. الرجاء المحاولة لاحقًا.')
+        logger.exception(f"Failed to notify credited user {target_id}: {e}")
+
+    await update.message.reply_text(f"Credited {amount} to {target}. New balance: {new_balance}")
+
+    # Notify other admins about the credit action and include WhatsApp contact if configured
+    wa_num = config.ADMIN_WHATSAPP_NUMBER
+    wa_link = f"https://wa.me/{wa_num}" if wa_num else ""
+    admin_msg = f"Admin @{user.username or user.first_name} credited {amount} to {target} (id: {target_id}). New balance: {new_balance}"
+    if wa_link:
+        admin_msg += f"\nContact via WhatsApp: {wa_link}"
+    for admin_id in config.ADMINS:
         try:
-            os.remove(tmp_receipt_path)
+            if admin_id == user.id:
+                continue
+            await context.bot.send_message(chat_id=admin_id, text=admin_msg)
         except Exception:
-            pass
-        return ConversationHandler.END
+            logger.exception(f"Failed to notify admin {admin_id} about credit")
 
-    # generate UUID and save to DB
-    leave_uuid = str(uuid.uuid4())
-    record = {
-        'id': leave_uuid,
-        'user_id': update.message.from_user.id,
-        'patient_name': context.user_data.get('patient_name'),
-        'duration': context.user_data.get('duration'),
-        'amount': amount,
-        'payment_status': 'paid',
-        'receipt_url': receipt_url
-    }
-
-    db = DBService()
-    try:
-        db.init_db()
-        db.save_sick_leave(record)
-    except Exception:
-        logging.exception('Failed to save record to DB')
-        await update.message.reply_text('حدث خطأ أثناء حفظ السجل في قاعدة البيانات.')
-        return ConversationHandler.END
-    finally:
-        db.close()
-
-    # generate pdf
-    try:
-        pdf_path = generate_sick_leave_pdf({
-            'patient_name': record['patient_name'],
-            'duration': record['duration'],
-            'uuid': leave_uuid,
-            'amount': amount
-        })
-
-        # send pdf to user
-        await update.message.reply_document(open(pdf_path, 'rb'))
-    except Exception:
-        logging.exception('Failed to generate/send PDF')
-        await update.message.reply_text('حدث خطأ أثناء إنشاء أو إرسال ملف الإجازة.')
-    finally:
-        # cleanup tmp files
-        try:
-            if os.path.exists(pdf_path):
-                os.remove(pdf_path)
-        except Exception:
-            pass
-        try:
-            if os.path.exists(tmp_receipt_path):
-                os.remove(tmp_receipt_path)
-        except Exception:
-            pass
-
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('تم إلغاء العملية.')
-    return ConversationHandler.END
-
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Sorry, I didn't understand that command.")
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError('BOT_TOKEN not set in environment')
+    if not config.BOT_TOKEN:
+        logger.error("BOT_TOKEN is not set in environment variables.")
+        return
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Ensure DB initialized
+    try:
+        db_service.init_db()
+    except Exception as e:
+        logger.exception("Failed to initialize DB: %s", e)
 
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_handler, pattern='^request$')],
-        states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_handler)],
-            DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, duration_handler)],
-            AWAIT_RECEIPT: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, receipt_handler)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        per_user=True
-    )
+    application = ApplicationBuilder().token(config.BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(conv)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("balance", balance))
+    application.add_handler(CommandHandler("credit", credit_command))
 
-    app.run_polling()
+    # receipt handler (photos and documents)
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_receipt))
+
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    logger.info("Bot started")
+    application.run_polling()
 
 if __name__ == '__main__':
     main()

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.env.*
+venv/
+.venv/
+ENV/
+
+# Logs
+*.log
+
+# Uploads and local storage
+uploads/
+
+# IDEs
+.vscode/
+.idea/
+
+# Byte-compiled / optimized
+.pytest_cache/
